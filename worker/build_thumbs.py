@@ -8,6 +8,7 @@ Build SKU thumbnails from worker/images.csv and save them into:
 - Resizes down so the longest side is <= target size
 - Tries to keep files small (quality loop), logs warnings if it can't hit target
 - Skips unchanged SKUs using worker/state.json (url hash)
+- DOES NOT FAIL the whole run if some URLs are broken; writes worker/failures.csv
 
 CSV expected: 2 columns: sku,url
 Delimiter can be comma, semicolon, or tab.
@@ -20,21 +21,17 @@ import csv
 import hashlib
 import io
 import json
-import os
 import re
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 import requests
 from PIL import Image, ImageOps
 
 
-# -----------------------------
-# Poka-yoke: safe printing
-# -----------------------------
 def log(msg: str) -> None:
     print(msg, flush=True)
 
@@ -44,9 +41,6 @@ def die(msg: str, code: int = 2) -> None:
     sys.exit(code)
 
 
-# -----------------------------
-# Config
-# -----------------------------
 SKU_RE = re.compile(r"^\d+$")  # digits only
 
 
@@ -65,7 +59,6 @@ def ensure_dir(p: Path) -> None:
 
 
 def detect_csv_dialect(sample: str) -> csv.Dialect:
-    # Robust: try sniff, fallback to common delimiters.
     sniffer = csv.Sniffer()
     try:
         return sniffer.sniff(sample, delimiters=[",", ";", "\t"])
@@ -85,7 +78,6 @@ def read_rows(csv_path: Path) -> List[Row]:
         die(f"CSV not found: {csv_path}")
 
     raw = csv_path.read_bytes()
-    # Try UTF-8-sig for BOM safety
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -100,7 +92,6 @@ def read_rows(csv_path: Path) -> List[Row]:
         if not parts:
             continue
 
-        # Support accidental extra columns: take first two non-empty tokens
         parts = [p.strip() for p in parts]
         parts = [p for p in parts if p != ""]
         if len(parts) < 2:
@@ -109,7 +100,6 @@ def read_rows(csv_path: Path) -> List[Row]:
 
         sku, url = parts[0], parts[1]
         if sku.lower() == "sku" and url.lower() in ("url", "link"):
-            # header row
             continue
 
         sku = sku.strip()
@@ -125,11 +115,10 @@ def read_rows(csv_path: Path) -> List[Row]:
 
         rows.append(Row(sku=sku, url=url))
 
-    # Dedupe by SKU (last one wins) to avoid fighting yourself
+    # last SKU wins
     dedup: Dict[str, Row] = {}
     for r in rows:
         dedup[r.sku] = r
-
     return list(dedup.values())
 
 
@@ -147,11 +136,18 @@ def save_state(state_path: Path, state: Dict[str, Dict]) -> None:
     state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def write_failures_csv(fail_path: Path, failures: List[Tuple[str, str, str]]) -> None:
+    ensure_dir(fail_path.parent)
+    with fail_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["sku", "url", "error"])
+        for sku, url, err in failures:
+            w.writerow([sku, url, err])
+
+
 def requests_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": "images_gallery-thumb-worker/1.0 (+GitHub Actions)"
-    })
+    s.headers.update({"User-Agent": "images_gallery-thumb-worker/1.1 (+GitHub Actions)"})
     return s
 
 
@@ -170,14 +166,9 @@ def download_image_bytes(sess: requests.Session, url: str, retries: int = 3) -> 
 
 
 def make_thumb(img: Image.Image, max_side: int) -> Image.Image:
-    # Fix orientation from EXIF (poka-yoke for phone images)
     img = ImageOps.exif_transpose(img)
-
-    # Convert to RGB for consistent encoding
-    if img.mode not in ("RGB",):
+    if img.mode != "RGB":
         img = img.convert("RGB")
-
-    # Resize down keeping aspect ratio (no distortion)
     thumb = img.copy()
     thumb.thumbnail((max_side, max_side), resample=Image.Resampling.LANCZOS)
     return thumb
@@ -189,20 +180,15 @@ def save_webp_with_target_size(
     target_min_kb: int = 1,
     target_max_kb: int = 5,
 ) -> Tuple[int, int]:
-    """
-    Save as WEBP, trying to land within [target_min_kb, target_max_kb].
-    Returns (final_bytes, final_quality).
-    """
     ensure_dir(out_path.parent)
 
-    # Quality loop: start decent, reduce if too big
     qualities = [80, 70, 60, 50, 45, 40, 35, 30]
     best_bytes = None
     best_q = None
 
     for q in qualities:
         buf = io.BytesIO()
-        img.save(buf, format="WEBP", quality=q, method=6)  # method=6 = better compression
+        img.save(buf, format="WEBP", quality=q, method=6)
         data = buf.getvalue()
         size_kb = len(data) / 1024.0
 
@@ -212,10 +198,8 @@ def save_webp_with_target_size(
         if target_min_kb <= size_kb <= target_max_kb:
             break
         if size_kb <= target_max_kb:
-            # Small enough; stop early
             break
 
-    # Atomic write
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     tmp.write_bytes(best_bytes)
     tmp.replace(out_path)
@@ -225,20 +209,19 @@ def save_webp_with_target_size(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", default="worker/images.csv", help="Path to images.csv")
-    parser.add_argument("--out", default="for_price", help="Output root folder")
-    parser.add_argument("--sizes", nargs="+", type=int, default=[200, 300], help="Thumbnail max side sizes")
-    parser.add_argument("--state", default="worker/state.json", help="State JSON path")
-    parser.add_argument("--force", action="store_true", help="Rebuild all thumbnails")
+    parser.add_argument("--csv", default="worker/images.csv")
+    parser.add_argument("--out", default="for_price")
+    parser.add_argument("--sizes", nargs="+", type=int, default=[200, 300])
+    parser.add_argument("--state", default="worker/state.json")
+    parser.add_argument("--failures", default="worker/failures.csv")
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     csv_path = Path(args.csv)
     out_root = Path(args.out)
     state_path = Path(args.state)
+    failures_path = Path(args.failures)
     sizes = sorted(set(args.sizes))
-
-    if not sizes:
-        die("No sizes provided")
 
     rows = read_rows(csv_path)
     if not rows:
@@ -250,6 +233,7 @@ def main() -> None:
     processed = 0
     skipped = 0
     failed = 0
+    failures: List[Tuple[str, str, str]] = []
 
     log(f"[OK] Loaded {len(rows)} unique SKUs from {csv_path}")
     log(f"[OK] Target sizes: {sizes}")
@@ -261,7 +245,6 @@ def main() -> None:
         st = state.get(r.sku, {})
         unchanged = (st.get("url_hash") == url_hash)
 
-        # Build expected output paths
         out_paths = [out_root / str(s) / f"{r.sku}.webp" for s in sizes]
         have_all = all(p.exists() for p in out_paths)
 
@@ -274,22 +257,28 @@ def main() -> None:
             img = Image.open(io.BytesIO(blob))
         except Exception as e:
             failed += 1
+            err = str(e)
+            failures.append((r.sku, r.url, err))
             log(f"[FAIL] {r.sku}: cannot load image from URL -> {e}")
+            # IMPORTANT: do NOT update state so it retries next run if you fix the URL
             continue
 
-        for s, out_path in zip(sizes, out_paths):
+        for s in sizes:
+            out_path = out_root / str(s) / f"{r.sku}.webp"
             try:
                 thumb = make_thumb(img, max_side=s)
                 final_bytes, q = save_webp_with_target_size(thumb, out_path)
                 kb = final_bytes / 1024.0
                 if kb > 5.0:
-                    log(f"[WARN] {r.sku} size {s}: {kb:.1f} KB (>{5} KB) even at quality={q}")
+                    log(f"[WARN] {r.sku} size {s}: {kb:.1f} KB (>5 KB) even at quality={q}")
                 else:
                     log(f"[OK] {r.sku} size {s}: {kb:.1f} KB (quality={q}) -> {out_path.as_posix()}")
             except Exception as e:
                 failed += 1
+                failures.append((r.sku, r.url, f"write size {s}: {e}"))
                 log(f"[FAIL] {r.sku} size {s}: cannot write thumb -> {e}")
 
+        # update state only if we got through processing this SKU (download succeeded)
         state[r.sku] = {
             "url": r.url,
             "url_hash": url_hash,
@@ -299,14 +288,15 @@ def main() -> None:
         processed += 1
 
     save_state(state_path, state)
+    write_failures_csv(failures_path, failures)
 
     log("----")
     log(f"[DONE] processed={processed} skipped={skipped} failed={failed}")
-    if failed == 0:
-        log("[OK] Completed successfully ✅")
-    else:
-        # Fail the action so you notice broken URLs
-        die(f"Completed with failures: {failed}", code=1)
+    log(f"[OK] failures report: {failures_path.as_posix()}")
+    log("[OK] Completed successfully ✅ (even if some links are broken)")
+
+    # Always exit 0: you explicitly want "skip + log"
+    sys.exit(0)
 
 
 if __name__ == "__main__":
