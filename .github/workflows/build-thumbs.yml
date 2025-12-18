@@ -35,14 +35,15 @@ jobs:
 
       - name: Build thumbnails (200 + 300)
         run: |
-          python worker/build_thumbs.py --csv worker/images.csv --out for_price --sizes 200 300 --state worker/state.json
+          python worker/build_thumbs.py --csv worker/images.csv --out for_price --sizes 200 300 --state worker/state.json --failures worker/failures.csv
 
       - name: Commit & push changes (if any)
+        if: always()
         run: |
           if [ -n "$(git status --porcelain)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add for_price worker/state.json
+            git add for_price worker/state.json worker/failures.csv
             git commit -m "Build thumbnails from worker/images.csv"
             git push
             echo "✅ Pushed updated thumbnails"
