@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -18,6 +19,7 @@ import requests
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 STATE_PATH = ".sync_state/sharepoint_sync_state.json"
 SKIP_SOURCE_FILENAMES = {".ds_store", "thumbs.db", "desktop.ini"}
+QPDF_SUPPORTED_OPTIONS: Optional[set[str]] = None
 
 
 class SyncError(RuntimeError):
@@ -383,6 +385,33 @@ def pdf_is_linearized(path: Path) -> bool:
     return b"/Linearized" in head
 
 
+def get_qpdf_supported_options(qpdf_path: str) -> set[str]:
+    global QPDF_SUPPORTED_OPTIONS
+    if QPDF_SUPPORTED_OPTIONS is not None:
+        return QPDF_SUPPORTED_OPTIONS
+
+    help_outputs: List[str] = []
+    for help_arg in ("--help=all", "--help"):
+        try:
+            result = subprocess.run(
+                [qpdf_path, help_arg],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            help_outputs.append(result.stdout or "")
+            help_outputs.append(result.stderr or "")
+        except Exception:
+            continue
+
+    options: set[str] = set()
+    for blob in help_outputs:
+        options.update(re.findall(r"--[a-z0-9][a-z0-9-]*", blob))
+
+    QPDF_SUPPORTED_OPTIONS = options
+    return options
+
+
 def optimize_pdf_in_place(path: Path) -> bool:
     if pdf_is_linearized(path):
         return False
@@ -393,29 +422,52 @@ def optimize_pdf_in_place(path: Path) -> bool:
             f"PDF requires optimization but qpdf is not available: {path}"
         )
 
+    supported = get_qpdf_supported_options(qpdf)
+
+    transform_flags: List[str] = []
+    if "--linearize" in supported:
+        transform_flags.append("--linearize")
+    if "--object-streams" in supported:
+        transform_flags.append("--object-streams=generate")
+    if "--recompress-flate" in supported:
+        transform_flags.append("--recompress-flate")
+    if "--compression-level" in supported:
+        transform_flags.append("--compression-level=9")
+
+    remove_flags: List[str] = []
+    if "--remove-info" in supported:
+        remove_flags.append("--remove-info")
+    if "--remove-metadata" in supported:
+        remove_flags.append("--remove-metadata")
+
     temp_path = path.with_suffix(path.suffix + ".tmp")
-    command = [
-        qpdf,
-        "--linearize",
-        "--object-streams=generate",
-        "--recompress-flate",
-        "--compression-level=9",
-        "--remove-info",
-        "--remove-metadata",
-        str(path),
-        str(temp_path),
-    ]
+    temp_meta_path = path.with_suffix(path.suffix + ".meta.tmp")
     try:
-        subprocess.run(command, check=True)
+        if remove_flags:
+            command = [qpdf, *transform_flags, *remove_flags, str(path), str(temp_path)]
+            subprocess.run(command, check=True)
+        else:
+            # Old qpdf fallback: rebuilding from --empty discards document-level metadata.
+            rebuild = [qpdf, "--empty", "--pages", str(path), "1-z", "--", str(temp_meta_path)]
+            subprocess.run(rebuild, check=True)
+            command = [qpdf, *transform_flags, str(temp_meta_path), str(temp_path)]
+            subprocess.run(command, check=True)
         os.replace(temp_path, path)
     except subprocess.CalledProcessError as error:
         if temp_path.exists():
             temp_path.unlink(missing_ok=True)
+        if temp_meta_path.exists():
+            temp_meta_path.unlink(missing_ok=True)
         raise SyncError(f"qpdf optimization failed for {path}: {error}") from error
     except Exception:
         if temp_path.exists():
             temp_path.unlink(missing_ok=True)
+        if temp_meta_path.exists():
+            temp_meta_path.unlink(missing_ok=True)
         raise
+    finally:
+        if temp_meta_path.exists():
+            temp_meta_path.unlink(missing_ok=True)
 
     if not pdf_is_linearized(path):
         raise SyncError(f"PDF linearization check failed after optimization: {path}")
