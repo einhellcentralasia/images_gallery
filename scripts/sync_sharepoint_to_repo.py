@@ -341,7 +341,7 @@ def optimize_mp4_in_place(path: Path) -> bool:
             f"MP4 requires fast-start remux but ffmpeg is not available: {path}"
         )
 
-    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path = path.with_name(f"{path.stem}.sync_tmp{path.suffix}")
     command = [
         ffmpeg,
         "-hide_banner",
@@ -440,8 +440,8 @@ def optimize_pdf_in_place(path: Path) -> bool:
     if "--remove-metadata" in supported:
         remove_flags.append("--remove-metadata")
 
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_meta_path = path.with_suffix(path.suffix + ".meta.tmp")
+    temp_path = path.with_name(f"{path.stem}.sync_tmp{path.suffix}")
+    temp_meta_path = path.with_name(f"{path.stem}.sync_meta_tmp{path.suffix}")
     try:
         if remove_flags:
             command = [qpdf, *transform_flags, *remove_flags, str(path), str(temp_path)]
