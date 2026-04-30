@@ -4,6 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import struct
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -14,6 +17,7 @@ import requests
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 STATE_PATH = ".sync_state/sharepoint_sync_state.json"
+SKIP_SOURCE_FILENAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 
 
 class SyncError(RuntimeError):
@@ -250,6 +254,8 @@ def list_source_files(token: str, drive_id: str, root_folder: str) -> Dict[str, 
                 name = item.get("name")
                 if not name:
                     continue
+                if name.strip().lower() in SKIP_SOURCE_FILENAMES:
+                    continue
                 item_rel = f"{rel_prefix}/{name}".strip("/")
                 if item.get("folder") is not None:
                     nested_folder = f"{folder_path}/{name}".strip("/")
@@ -278,6 +284,142 @@ def download_file(token: str, drive_id: str, item_id: str, target_path: Path) ->
         for chunk in response.iter_content(chunk_size=1024 * 1024):
             if chunk:
                 handle.write(chunk)
+
+
+def mp4_has_faststart(path: Path) -> bool:
+    with path.open("rb") as handle:
+        pos = 0
+        moov: Optional[int] = None
+        mdat: Optional[int] = None
+        for _ in range(512):
+            header = handle.read(8)
+            if len(header) < 8:
+                break
+            size, box_type = struct.unpack(">I4s", header)
+            box_type_text = box_type.decode("latin1")
+            header_size = 8
+
+            if size == 1:
+                ext = handle.read(8)
+                if len(ext) < 8:
+                    break
+                size = struct.unpack(">Q", ext)[0]
+                header_size = 16
+            elif size == 0:
+                break
+
+            if size < header_size:
+                break
+
+            if box_type_text == "moov" and moov is None:
+                moov = pos
+            if box_type_text == "mdat" and mdat is None:
+                mdat = pos
+            if moov is not None and mdat is not None:
+                return moov < mdat
+
+            skip = size - header_size
+            handle.seek(skip, os.SEEK_CUR)
+            pos += size
+
+    if moov is None:
+        raise SyncError(f"Could not find 'moov' box in MP4: {path}")
+    if mdat is None:
+        raise SyncError(f"Could not find 'mdat' box in MP4: {path}")
+    return moov < mdat
+
+
+def optimize_mp4_in_place(path: Path) -> bool:
+    if mp4_has_faststart(path):
+        return False
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise SyncError(
+            f"MP4 requires fast-start remux but ffmpeg is not available: {path}"
+        )
+
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(path),
+        "-map",
+        "0",
+        "-map_metadata",
+        "-1",
+        "-map_chapters",
+        "-1",
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(temp_path),
+    ]
+    try:
+        subprocess.run(command, check=True)
+        os.replace(temp_path, path)
+    except subprocess.CalledProcessError as error:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise SyncError(f"ffmpeg remux failed for {path}: {error}") from error
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise
+
+    if not mp4_has_faststart(path):
+        raise SyncError(f"MP4 fast-start check failed after remux: {path}")
+    return True
+
+
+def pdf_is_linearized(path: Path) -> bool:
+    with path.open("rb") as handle:
+        head = handle.read(2048)
+    return b"/Linearized" in head
+
+
+def optimize_pdf_in_place(path: Path) -> bool:
+    if pdf_is_linearized(path):
+        return False
+
+    qpdf = shutil.which("qpdf")
+    if not qpdf:
+        raise SyncError(
+            f"PDF requires optimization but qpdf is not available: {path}"
+        )
+
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    command = [
+        qpdf,
+        "--linearize",
+        "--object-streams=generate",
+        "--recompress-flate",
+        "--compression-level=9",
+        "--remove-info",
+        "--remove-metadata",
+        str(path),
+        str(temp_path),
+    ]
+    try:
+        subprocess.run(command, check=True)
+        os.replace(temp_path, path)
+    except subprocess.CalledProcessError as error:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise SyncError(f"qpdf optimization failed for {path}: {error}") from error
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise
+
+    if not pdf_is_linearized(path):
+        raise SyncError(f"PDF linearization check failed after optimization: {path}")
+    return True
 
 
 def cleanup_empty_dirs(path: Path) -> None:
@@ -388,6 +530,8 @@ def sync_one_mapping(
     created = 0
     deleted = 0
     skipped = 0
+    optimized_mp4 = 0
+    optimized_pdf = 0
     new_state: Dict[str, Dict[str, str]] = {}
 
     for rel_path, source_file in sorted(source_files.items()):
@@ -410,10 +554,21 @@ def sync_one_mapping(
             local_path.unlink()
             deleted += 1
 
+    for rel_path in sorted(source_rel_paths):
+        local_path = destination_dir / Path(rel_path)
+        suffix = local_path.suffix.lower()
+        if suffix == ".mp4":
+            if optimize_mp4_in_place(local_path):
+                optimized_mp4 += 1
+        elif suffix == ".pdf":
+            if optimize_pdf_in_place(local_path):
+                optimized_pdf += 1
+
     cleanup_empty_dirs(destination_dir)
     print(
         f"[sync] {destination_name}: source={len(source_files)} created={created} "
         f"updated={updated} deleted={deleted} skipped={skipped} "
+        f"optimized_mp4={optimized_mp4} optimized_pdf={optimized_pdf} "
         f"dest={destination_key}"
     )
     return len(source_files), created, updated + deleted, skipped, new_state

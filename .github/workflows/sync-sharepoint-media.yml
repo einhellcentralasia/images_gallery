@@ -30,6 +30,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
+      - name: Install media tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg qpdf
+
       - name: Sync media from SharePoint
         env:
           TENANT_ID: ${{ secrets.TENANT_ID }}
