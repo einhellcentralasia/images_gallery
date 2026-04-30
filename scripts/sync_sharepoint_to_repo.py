@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,7 @@ import requests
 
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+STATE_PATH = ".sync_state/sharepoint_sync_state.json"
 
 
 class SyncError(RuntimeError):
@@ -24,6 +26,12 @@ class SharePointTarget:
     site_id: str
     drive_id: str
     folder_path: str
+
+
+@dataclass
+class SourceFile:
+    item_id: str
+    etag: str
 
 
 def env_first(names: Iterable[str]) -> Tuple[str, str]:
@@ -220,17 +228,17 @@ def list_children_page(token: str, drive_id: str, folder_path: str, next_url: Op
         encoded = quote(folder_path, safe="/")
         endpoint = (
             f"/drives/{drive_id}/root:/{encoded}:/children"
-            "?$select=id,name,file,folder&$top=200"
+            "?$select=id,name,eTag,file,folder&$top=200"
         )
     else:
-        endpoint = f"/drives/{drive_id}/root/children?$select=id,name,file,folder&$top=200"
+        endpoint = f"/drives/{drive_id}/root/children?$select=id,name,eTag,file,folder&$top=200"
 
     response = graph_request(token, "GET", endpoint)
     return response.json()
 
 
-def list_source_files(token: str, drive_id: str, root_folder: str) -> Dict[str, str]:
-    files: Dict[str, str] = {}
+def list_source_files(token: str, drive_id: str, root_folder: str) -> Dict[str, SourceFile]:
+    files: Dict[str, SourceFile] = {}
     queue: List[Tuple[str, str]] = [("", root_folder.strip("/"))]
 
     while queue:
@@ -247,7 +255,10 @@ def list_source_files(token: str, drive_id: str, root_folder: str) -> Dict[str, 
                     nested_folder = f"{folder_path}/{name}".strip("/")
                     queue.append((item_rel, nested_folder))
                 elif item.get("file") is not None:
-                    files[item_rel] = item["id"]
+                    etag = item.get("eTag")
+                    if not etag:
+                        raise SyncError(f"Missing eTag for source file: {item_rel}")
+                    files[item_rel] = SourceFile(item_id=item["id"], etag=etag)
             next_url = payload.get("@odata.nextLink")
             if not next_url:
                 break
@@ -279,6 +290,32 @@ def cleanup_empty_dirs(path: Path) -> None:
         if root_path == path:
             continue
         root_path.rmdir()
+
+
+def load_state(repo_root: Path) -> Dict[str, Dict[str, Dict[str, str]]]:
+    state_file = repo_root / STATE_PATH
+    if not state_file.exists():
+        return {}
+
+    try:
+        payload = json.loads(state_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise SyncError(f"Invalid sync state JSON ({state_file}): {error}") from error
+
+    mappings = payload.get("mappings", {})
+    if not isinstance(mappings, dict):
+        raise SyncError(f"Invalid sync state format in {state_file}")
+    return mappings
+
+
+def save_state(repo_root: Path, mappings: Dict[str, Dict[str, Dict[str, str]]]) -> None:
+    state_file = repo_root / STATE_PATH
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": 1, "mappings": mappings}
+    state_file.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def find_destination_dirs(repo_root: Path, folder_name: str) -> List[Path]:
@@ -322,10 +359,12 @@ def load_mappings(repo_root: Path) -> List[Tuple[str, str, Path]]:
 
 def sync_one_mapping(
     token: str,
+    repo_root: Path,
     destination_name: str,
     source_link: str,
     destination_dir: Path,
-) -> Tuple[int, int, int]:
+    previous_state: Dict[str, Dict[str, str]],
+) -> Tuple[int, int, int, int, Dict[str, Dict[str, str]]]:
     if not destination_dir.is_dir():
         raise SyncError(
             f"Destination folder for '{destination_name}' must exist and will not be created: "
@@ -336,6 +375,7 @@ def sync_one_mapping(
     sp_target = resolve_site_and_library(token, normalized_url)
     source_files = list_source_files(token, sp_target.drive_id, sp_target.folder_path)
     source_rel_paths = set(source_files.keys())
+    destination_key = destination_dir.relative_to(repo_root).as_posix()
 
     local_files: Dict[str, Path] = {}
     for path in destination_dir.rglob("*"):
@@ -347,15 +387,23 @@ def sync_one_mapping(
     updated = 0
     created = 0
     deleted = 0
+    skipped = 0
+    new_state: Dict[str, Dict[str, str]] = {}
 
-    for rel_path, item_id in sorted(source_files.items()):
+    for rel_path, source_file in sorted(source_files.items()):
         target_path = destination_dir / Path(rel_path)
         before_exists = target_path.exists()
-        download_file(token, sp_target.drive_id, item_id, target_path)
-        if before_exists:
-            updated += 1
+        previous_entry = previous_state.get(rel_path, {})
+        previous_etag = previous_entry.get("etag")
+        if before_exists and previous_etag and previous_etag == source_file.etag:
+            skipped += 1
         else:
-            created += 1
+            download_file(token, sp_target.drive_id, source_file.item_id, target_path)
+            if before_exists:
+                updated += 1
+            else:
+                created += 1
+        new_state[rel_path] = {"etag": source_file.etag}
 
     for rel_path, local_path in sorted(local_files.items()):
         if rel_path not in source_rel_paths:
@@ -365,9 +413,10 @@ def sync_one_mapping(
     cleanup_empty_dirs(destination_dir)
     print(
         f"[sync] {destination_name}: source={len(source_files)} created={created} "
-        f"updated={updated} deleted={deleted}"
+        f"updated={updated} deleted={deleted} skipped={skipped} "
+        f"dest={destination_key}"
     )
-    return len(source_files), created, updated + deleted
+    return len(source_files), created, updated + deleted, skipped, new_state
 
 
 def parse_args() -> argparse.Namespace:
@@ -394,25 +443,36 @@ def main() -> int:
     mappings = load_mappings(repo_root)
     if not mappings:
         raise SyncError("No mapping files found under addresses/*.txt")
+    state_mappings = load_state(repo_root)
+    new_state_mappings: Dict[str, Dict[str, Dict[str, str]]] = {}
 
     print(f"[sync] mappings found: {len(mappings)}")
-    totals = {"source_files": 0, "created": 0, "changed_or_deleted": 0}
+    totals = {"source_files": 0, "created": 0, "changed_or_deleted": 0, "skipped": 0}
     for destination_name, source_link, destination_dir in mappings:
-        source_count, created, changed_or_deleted = sync_one_mapping(
+        destination_key = destination_dir.relative_to(repo_root).as_posix()
+        previous_state = state_mappings.get(destination_key, {})
+        source_count, created, changed_or_deleted, skipped, new_state = sync_one_mapping(
             token,
+            repo_root,
             destination_name,
             source_link,
             destination_dir,
+            previous_state,
         )
         totals["source_files"] += source_count
         totals["created"] += created
         totals["changed_or_deleted"] += changed_or_deleted
+        totals["skipped"] += skipped
+        new_state_mappings[destination_key] = new_state
+
+    save_state(repo_root, new_state_mappings)
 
     print(
         "[sync] done: "
         f"source_files={totals['source_files']} "
         f"created={totals['created']} "
-        f"changed_or_deleted={totals['changed_or_deleted']}"
+        f"changed_or_deleted={totals['changed_or_deleted']} "
+        f"skipped={totals['skipped']}"
     )
     return 0
 
