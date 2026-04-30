@@ -42,6 +42,10 @@ jobs:
           CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
         run: python scripts/sync_sharepoint_to_repo.py
 
+
+      - name: Validate media web-playback layout
+        run: python scripts_check_media_health.py --fail-on-slow
+
       - name: Commit and push if changed
         run: |
           if [ -n "$(git status --porcelain)" ]; then
