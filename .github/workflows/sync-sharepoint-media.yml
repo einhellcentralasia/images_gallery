@@ -16,6 +16,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,7 +34,7 @@ jobs:
       - name: Install media tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg qpdf
+          sudo apt-get install -y ffmpeg qpdf awscli
 
       - name: Sync media from SharePoint
         env:
@@ -46,14 +47,71 @@ jobs:
       - name: Validate media web-playback layout
         run: python scripts_check_media_health.py --fail-on-slow
 
-      - name: Commit and push if changed
+      - name: Detect repository changes
+        id: repo_changes
         run: |
           if [ -n "$(git status --porcelain)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add -A
-            git commit -m "chore: sync media from sharepoint"
-            git push
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Repository has changes"
           else
-            echo "No repository changes"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Repository unchanged"
           fi
+
+      - name: Sync changed media to R2
+        if: steps.repo_changes.outputs.changed == 'true'
+        env:
+          # Cloudflare R2 API token fields from dashboard:
+          # Access Key ID, Secret Access Key, and jurisdiction-specific endpoint.
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT_URL: ${{ secrets.R2_S3_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          test -n "${R2_ENDPOINT_URL}"
+          test -n "${R2_BUCKET}"
+          aws --version
+
+          # Keep R2 in lockstep for required media/text types.
+          aws s3 sync main "s3://${R2_BUCKET}/main" \
+            --endpoint-url "${R2_ENDPOINT_URL}" \
+            --delete \
+            --exclude "*" \
+            --include "*.jpg" --include "*.jpeg" --include "*.png" --include "*.webp" --include "*.gif" --include "*.avif" --include "*.svg" \
+            --include "*.txt" --include "*.pdf" --include "*.mp4" --include "*.webm" --include "*.mov" \
+            --no-progress --only-show-errors
+
+          aws s3 sync catalogues "s3://${R2_BUCKET}/catalogues" \
+            --endpoint-url "${R2_ENDPOINT_URL}" \
+            --delete \
+            --exclude "*" \
+            --include "*.jpg" --include "*.jpeg" --include "*.png" --include "*.webp" --include "*.gif" --include "*.avif" --include "*.svg" \
+            --include "*.txt" --include "*.pdf" --include "*.mp4" --include "*.webm" --include "*.mov" \
+            --no-progress --only-show-errors
+
+          aws s3 sync explosion "s3://${R2_BUCKET}/explosion" \
+            --endpoint-url "${R2_ENDPOINT_URL}" \
+            --delete \
+            --exclude "*" \
+            --include "*.jpg" --include "*.jpeg" --include "*.png" --include "*.webp" --include "*.gif" --include "*.avif" --include "*.svg" \
+            --include "*.txt" --include "*.pdf" --include "*.mp4" --include "*.webm" --include "*.mov" \
+            --no-progress --only-show-errors
+
+          aws s3 sync videos "s3://${R2_BUCKET}/videos" \
+            --endpoint-url "${R2_ENDPOINT_URL}" \
+            --delete \
+            --exclude "*" \
+            --include "*.jpg" --include "*.jpeg" --include "*.png" --include "*.webp" --include "*.gif" --include "*.avif" --include "*.svg" \
+            --include "*.txt" --include "*.pdf" --include "*.mp4" --include "*.webm" --include "*.mov" \
+            --no-progress --only-show-errors
+
+      - name: Commit and push if changed
+        if: steps.repo_changes.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: sync media from sharepoint"
+          git push
