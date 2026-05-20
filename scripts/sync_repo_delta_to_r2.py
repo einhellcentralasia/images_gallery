@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List, Sequence, Set, Tuple
 
 
-TARGET_ROOTS: Tuple[str, ...] = ("main", "catalogues", "explosion", "videos")
+DEFAULT_TARGET_ROOTS: Tuple[str, ...] = ("main", "addresses", "catalogues", "explosion", "videos")
 ALLOWED_SUFFIXES: Set[str] = {
     ".jpg",
     ".jpeg",
@@ -25,6 +25,7 @@ ALLOWED_SUFFIXES: Set[str] = {
     ".mov",
 }
 SYNC_TAG_ENV = "R2_SYNC_TAG"
+TARGET_ROOTS_ENV = "R2_SYNC_TARGET_ROOTS"
 DEFAULT_SYNC_TAG = "r2-last-synced"
 
 
@@ -53,14 +54,34 @@ def require_env(name: str) -> str:
     return value
 
 
+def parse_target_roots() -> Tuple[str, ...]:
+    raw = os.getenv(TARGET_ROOTS_ENV, "").strip()
+    if not raw:
+        return DEFAULT_TARGET_ROOTS
+
+    parts = [part.strip().strip("/") for part in raw.split(",")]
+    cleaned = [part for part in parts if part and part != "."]
+    if not cleaned:
+        return DEFAULT_TARGET_ROOTS
+
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    for part in cleaned:
+        normalized = part.lstrip("./")
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            ordered.append(normalized)
+    return tuple(ordered) if ordered else DEFAULT_TARGET_ROOTS
+
+
 def allowed_path(path: str) -> bool:
     lower = path.lower()
     return any(lower.endswith(ext) for ext in ALLOWED_SUFFIXES)
 
 
-def ensure_in_roots(path: str) -> bool:
+def ensure_in_roots(path: str, target_roots: Sequence[str]) -> bool:
     normalized = path.lstrip("./")
-    return any(normalized == root or normalized.startswith(f"{root}/") for root in TARGET_ROOTS)
+    return any(normalized == root or normalized.startswith(f"{root}/") for root in target_roots)
 
 
 def aws_cp(local_path: str, bucket: str, endpoint: str) -> None:
@@ -95,13 +116,13 @@ def aws_rm(remote_path: str, bucket: str, endpoint: str) -> None:
     )
 
 
-def full_sync(bucket: str, endpoint: str) -> Tuple[int, int]:
+def full_sync(bucket: str, endpoint: str, target_roots: Sequence[str]) -> Tuple[int, int]:
     include_args: List[str] = []
     for ext in sorted(ALLOWED_SUFFIXES):
         include_args.extend(["--include", f"*{ext}"])
 
     synced_roots = 0
-    for root in TARGET_ROOTS:
+    for root in target_roots:
         if not Path(root).exists():
             continue
         run(
@@ -173,6 +194,8 @@ def main() -> int:
     require_env("AWS_SECRET_ACCESS_KEY")
     bucket = require_env("R2_BUCKET")
     endpoint = require_env("R2_ENDPOINT_URL")
+    target_roots = parse_target_roots()
+    print(f"[r2-sync] target roots: {', '.join(target_roots)}")
 
     sync_tag = os.getenv(SYNC_TAG_ENV, DEFAULT_SYNC_TAG).strip() or DEFAULT_SYNC_TAG
     sync_ref = f"refs/tags/{sync_tag}"
@@ -181,7 +204,7 @@ def main() -> int:
     base_check = run(["git", "rev-parse", "-q", "--verify", f"{sync_ref}^{{commit}}"], capture=True, check=False)
     if base_check.returncode != 0:
         print(f"[r2-sync] no sync marker tag '{sync_tag}' found; running one-time full sync")
-        full_sync(bucket, endpoint)
+        full_sync(bucket, endpoint, target_roots)
         run(["git", "tag", "-f", sync_tag, head_commit])
         print(f"[r2-sync] marker updated to {head_commit[:12]}")
         return 0
@@ -197,7 +220,7 @@ def main() -> int:
             base_commit,
             head_commit,
             "--",
-            *TARGET_ROOTS,
+            *target_roots,
         ],
         capture=True,
     )
@@ -207,14 +230,14 @@ def main() -> int:
         {
             p.lstrip("./")
             for p in uploads
-            if ensure_in_roots(p) and allowed_path(p) and Path(p).is_file()
+            if ensure_in_roots(p, target_roots) and allowed_path(p) and Path(p).is_file()
         }
     )
     filtered_deletions = sorted(
         {
             p.lstrip("./")
             for p in deletions
-            if ensure_in_roots(p) and allowed_path(p)
+            if ensure_in_roots(p, target_roots) and allowed_path(p)
         }
     )
 
