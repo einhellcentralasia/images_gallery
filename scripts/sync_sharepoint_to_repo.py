@@ -584,6 +584,7 @@ def sync_one_mapping(
     skipped = 0
     optimized_mp4 = 0
     optimized_pdf = 0
+    pdf_optimize_warnings = 0
     new_state: Dict[str, Dict[str, str]] = {}
 
     for rel_path, source_file in sorted(source_files.items()):
@@ -613,14 +614,19 @@ def sync_one_mapping(
             if optimize_mp4_in_place(local_path):
                 optimized_mp4 += 1
         elif suffix == ".pdf":
-            if optimize_pdf_in_place(local_path):
-                optimized_pdf += 1
+            try:
+                if optimize_pdf_in_place(local_path):
+                    optimized_pdf += 1
+            except SyncError as error:
+                pdf_optimize_warnings += 1
+                print(f"[sync] WARN: PDF optimization skipped for {local_path}: {error}")
 
     cleanup_empty_dirs(destination_dir)
     print(
         f"[sync] {destination_name}: source={len(source_files)} created={created} "
         f"updated={updated} deleted={deleted} skipped={skipped} "
         f"optimized_mp4={optimized_mp4} optimized_pdf={optimized_pdf} "
+        f"pdf_optimize_warnings={pdf_optimize_warnings} "
         f"dest={destination_key}"
     )
     return len(source_files), created, updated + deleted, skipped, new_state

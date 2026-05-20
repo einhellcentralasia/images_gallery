@@ -18,6 +18,7 @@ ALLOWED_SUFFIXES: Set[str] = {
     ".avif",
     ".svg",
     ".txt",
+    ".csv",
     ".pdf",
     ".mp4",
     ".webm",
