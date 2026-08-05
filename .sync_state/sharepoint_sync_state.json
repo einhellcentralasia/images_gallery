@@ -1617,6 +1617,17 @@
       "fallback_video.avif": {
         "etag": "\"{99E7016C-B765-4A51-A9C0-EB06B545BB99},1\""
       }
+    },
+    "videos/vids": {
+      "amg_campaign.mp4": {
+        "etag": "\"{A24ABC19-CA75-452A-927B-C06B5B65C35D},4\""
+      },
+      "bayern_campaign.mp4": {
+        "etag": "\"{C92B2D85-33BA-429F-819E-40ED6D36DCFB},3\""
+      },
+      "why_einhell.mp4": {
+        "etag": "\"{523DC9F8-C4AE-4072-8136-3D8B74BA2145},4\""
+      }
     }
   },
   "version": 1
